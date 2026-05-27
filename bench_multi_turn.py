@@ -39,8 +39,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
+from transformers import AutoTokenizer
 
-from sglang.benchmark.utils import get_tokenizer
+
+def get_tokenizer(pretrained_model_name_or_path: str):
+    """Load a HF tokenizer. Kept as a tiny wrapper so the script runs
+    standalone without any sglang-internal imports."""
+    assert pretrained_model_name_or_path, "tokenizer path is required"
+    return AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
 
 
 # --------------------------------------------------------------------------- #
