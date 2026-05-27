@@ -1322,6 +1322,8 @@ class Summary:
     median_ttft_ms: float
     p99_ttft_ms: float
     mean_tpot_ms: float
+    median_tpot_ms: float
+    p90_tpot_ms: float
     p99_tpot_ms: float
     mean_e2e_latency_ms: float
     p90_e2e_latency_ms: float
@@ -1372,6 +1374,8 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         median_ttft_ms=_percentile(ttfts, 50),
         p99_ttft_ms=_percentile(ttfts, 99),
         mean_tpot_ms=float(np.mean(tpots)) if tpots else 0.0,
+        median_tpot_ms=_percentile(tpots, 50),
+        p90_tpot_ms=_percentile(tpots, 90),
         p99_tpot_ms=_percentile(tpots, 99),
         mean_e2e_latency_ms=float(np.mean(e2es)) if e2es else 0.0,
         p90_e2e_latency_ms=_percentile(e2es, 90),
@@ -1494,6 +1498,8 @@ def print_summary(summary: Summary) -> None:
     print(f"{'Median TTFT (ms)':<30}{summary.median_ttft_ms:.2f}")
     print(f"{'P99 TTFT (ms)':<30}{summary.p99_ttft_ms:.2f}")
     print(f"{'Mean TPOT (ms)':<30}{summary.mean_tpot_ms:.2f}")
+    print(f"{'Median TPOT (ms)':<30}{summary.median_tpot_ms:.2f}")
+    print(f"{'P90 TPOT (ms)':<30}{summary.p90_tpot_ms:.2f}")
     print(f"{'P99 TPOT (ms)':<30}{summary.p99_tpot_ms:.2f}")
     print(f"{'Mean E2E (ms)':<30}{summary.mean_e2e_latency_ms:.2f}")
     print(f"{'P90 E2E (ms)':<30}{summary.p90_e2e_latency_ms:.2f}")
