@@ -89,6 +89,7 @@ class Config:
     port: int
     api_key: Optional[str]
     extra_headers: List[str]
+    extra_request_body: Dict[str, Any]
     # concurrency
     num_prompts: int
     max_concurrency: int
@@ -223,6 +224,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--api-key", type=str, default=None)
     p.add_argument("--header", action="append", default=[],
                    help="Extra HTTP header 'Key=Value'; can repeat.")
+    p.add_argument("--extra-request-body", type=str, default=None,
+                   help="JSON string merged into every request payload. "
+                        "Useful for decode-only / fake-prefill benchmarking, "
+                        "e.g. --extra-request-body "
+                        "'{\"bootstrap_host\": \"2.2.2.2\", \"bootstrap_room\": 0}' "
+                        "when the decode server is launched with "
+                        "--disaggregation-transfer-backend fake.")
     # concurrency
     p.add_argument("--num-prompts", type=int, default=None,
                    help="Cap on total requests sent (default: groups*prompts*turns).")
@@ -257,6 +265,16 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def args_to_config(args: argparse.Namespace) -> Config:
     tokenizer = args.tokenizer or args.model
+    extra_body: Dict[str, Any] = {}
+    if args.extra_request_body:
+        try:
+            extra_body = json.loads(args.extra_request_body)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"--extra-request-body is not valid JSON: {e}"
+            ) from None
+        if not isinstance(extra_body, dict):
+            raise ValueError("--extra-request-body must be a JSON object.")
     if args.load_dataset:
         # Topology/length fields will be set from the loaded data later.
         # Use 0 as placeholders; num_prompts cap is also resolved post-load.
@@ -300,6 +318,7 @@ def args_to_config(args: argparse.Namespace) -> Config:
         port=args.port,
         api_key=args.api_key,
         extra_headers=list(args.header or []),
+        extra_request_body=extra_body,
         num_prompts=num_prompts,
         max_concurrency=args.max_concurrency,
         request_rate=args.request_rate,
@@ -861,6 +880,8 @@ async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
     if cfg.disable_stream:
         # For non-streaming also request ids so we can replay
         payload["return_token_ids"] = True
+    if cfg.extra_request_body:
+        payload.update(cfg.extra_request_body)
 
     headers = _build_headers(cfg, routing_key)
     start = time.perf_counter()
@@ -956,6 +977,8 @@ async def _send_oai_chat(session: aiohttp.ClientSession, cfg: Config,
     }
     if not cfg.disable_stream:
         payload["stream_options"] = {"include_usage": True}
+    if cfg.extra_request_body:
+        payload.update(cfg.extra_request_body)
     headers = _build_headers(cfg, routing_key)
     start = time.perf_counter()
     ttft = 0.0
