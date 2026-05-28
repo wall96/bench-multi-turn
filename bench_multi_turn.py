@@ -1397,6 +1397,33 @@ def _percentile(values: List[float], p: float) -> float:
     return float(np.percentile(values, p))
 
 
+def _trim_stats(values: List[float]) -> Dict[str, float]:
+    """Drop one min and one max sample, then compute mean / p50 / p90 / p99.
+    Trims only when len >= 3, otherwise no-op. Returns the dropped values
+    so they can be reported alongside the cleaned percentiles."""
+    if not values:
+        return {"mean": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0,
+                "min_dropped": 0.0, "max_dropped": 0.0, "n_used": 0}
+    if len(values) >= 3:
+        s = sorted(values)
+        min_dropped = s[0]
+        max_dropped = s[-1]
+        used = s[1:-1]
+    else:
+        min_dropped = float("nan")
+        max_dropped = float("nan")
+        used = list(values)
+    return {
+        "mean": float(np.mean(used)) if used else 0.0,
+        "p50": _percentile(used, 50),
+        "p90": _percentile(used, 90),
+        "p99": _percentile(used, 99),
+        "min_dropped": min_dropped,
+        "max_dropped": max_dropped,
+        "n_used": len(used),
+    }
+
+
 @dataclass
 class Summary:
     case_name: str
@@ -1452,6 +1479,21 @@ class Summary:
     mean_prompt_len_expected: float
     mean_prompt_len_actual: float
     mean_prompt_len_diff: float
+    # All percentile/mean values above are computed AFTER dropping one
+    # min + one max sample per metric (when there are >= 3 samples). The
+    # dropped values are surfaced here so a freak outlier is visible
+    # rather than silently subtracted.
+    ttft_min_dropped_ms: float
+    ttft_max_dropped_ms: float
+    tpot_min_dropped_ms: float
+    tpot_max_dropped_ms: float
+    tpot_corrected_min_dropped_ms: float
+    tpot_corrected_max_dropped_ms: float
+    e2e_min_dropped_ms: float
+    e2e_max_dropped_ms: float
+    itl_min_dropped_ms: float
+    itl_max_dropped_ms: float
+    n_used_after_trim: int
 
 
 def _compute_summary(cfg: Config, records: List[RequestRecord],
@@ -1483,6 +1525,19 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
     req_tp = len(ok) / duration
     in_tp = input_act_sum / duration
     out_tp = output_act_sum / duration
+
+    # Trimmed stats: drop 1 min + 1 max from each list before computing
+    # mean / percentiles. Outliers (a single retry, a freak preempted
+    # request) are visible separately as *_min_dropped_ms /
+    # *_max_dropped_ms so they aren't silently lost.
+    ttft_s = _trim_stats(ttfts)
+    tpot_s = _trim_stats(tpots)
+    tpot_corr_s = _trim_stats(tpot_corrs)
+    e2e_s = _trim_stats(e2es)
+    itl_mean_s = _trim_stats(itl_means)
+    itl_p50_s = _trim_stats(itl_p50s)
+    itl_p90_s = _trim_stats(itl_p90s)
+    itl_p99_s = _trim_stats(itl_p99s)
 
     # Active span: from the first successful request's send time to the last
     # successful request's completion. Throughputs computed against this span
@@ -1524,31 +1579,42 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         request_throughput_active=req_tp_act,
         input_throughput_active=in_tp_act,
         output_throughput_active=out_tp_act,
-        mean_ttft_ms=float(np.mean(ttfts)) if ttfts else 0.0,
-        median_ttft_ms=_percentile(ttfts, 50),
-        p90_ttft_ms=_percentile(ttfts, 90),
-        p99_ttft_ms=_percentile(ttfts, 99),
-        mean_tpot_ms=float(np.mean(tpots)) if tpots else 0.0,
-        median_tpot_ms=_percentile(tpots, 50),
-        p90_tpot_ms=_percentile(tpots, 90),
-        p99_tpot_ms=_percentile(tpots, 99),
-        mean_tpot_corrected_ms=float(np.mean(tpot_corrs)) if tpot_corrs else 0.0,
-        median_tpot_corrected_ms=_percentile(tpot_corrs, 50),
-        p90_tpot_corrected_ms=_percentile(tpot_corrs, 90),
-        p99_tpot_corrected_ms=_percentile(tpot_corrs, 99),
-        mean_itl_ms=float(np.mean(itl_means)) if itl_means else 0.0,
-        median_itl_ms=float(np.mean(itl_p50s)) if itl_p50s else 0.0,
-        p90_itl_ms=float(np.mean(itl_p90s)) if itl_p90s else 0.0,
-        p99_itl_ms=float(np.mean(itl_p99s)) if itl_p99s else 0.0,
+        mean_ttft_ms=ttft_s["mean"],
+        median_ttft_ms=ttft_s["p50"],
+        p90_ttft_ms=ttft_s["p90"],
+        p99_ttft_ms=ttft_s["p99"],
+        mean_tpot_ms=tpot_s["mean"],
+        median_tpot_ms=tpot_s["p50"],
+        p90_tpot_ms=tpot_s["p90"],
+        p99_tpot_ms=tpot_s["p99"],
+        mean_tpot_corrected_ms=tpot_corr_s["mean"],
+        median_tpot_corrected_ms=tpot_corr_s["p50"],
+        p90_tpot_corrected_ms=tpot_corr_s["p90"],
+        p99_tpot_corrected_ms=tpot_corr_s["p99"],
+        mean_itl_ms=itl_mean_s["mean"],
+        median_itl_ms=itl_p50_s["mean"],
+        p90_itl_ms=itl_p90_s["mean"],
+        p99_itl_ms=itl_p99_s["mean"],
         mean_first_chunk_tokens=float(np.mean(first_chunk_toks)) if first_chunk_toks else 0.0,
         mean_tokens_per_chunk=float(np.mean(tokens_per_chunk)) if tokens_per_chunk else 0.0,
-        mean_e2e_latency_ms=float(np.mean(e2es)) if e2es else 0.0,
-        median_e2e_latency_ms=_percentile(e2es, 50),
-        p90_e2e_latency_ms=_percentile(e2es, 90),
-        p99_e2e_latency_ms=_percentile(e2es, 99),
+        mean_e2e_latency_ms=e2e_s["mean"],
+        median_e2e_latency_ms=e2e_s["p50"],
+        p90_e2e_latency_ms=e2e_s["p90"],
+        p99_e2e_latency_ms=e2e_s["p99"],
         mean_prompt_len_expected=mean_exp,
         mean_prompt_len_actual=mean_act,
         mean_prompt_len_diff=mean_act - mean_exp,
+        ttft_min_dropped_ms=ttft_s["min_dropped"],
+        ttft_max_dropped_ms=ttft_s["max_dropped"],
+        tpot_min_dropped_ms=tpot_s["min_dropped"],
+        tpot_max_dropped_ms=tpot_s["max_dropped"],
+        tpot_corrected_min_dropped_ms=tpot_corr_s["min_dropped"],
+        tpot_corrected_max_dropped_ms=tpot_corr_s["max_dropped"],
+        e2e_min_dropped_ms=e2e_s["min_dropped"],
+        e2e_max_dropped_ms=e2e_s["max_dropped"],
+        itl_min_dropped_ms=itl_mean_s["min_dropped"],
+        itl_max_dropped_ms=itl_mean_s["max_dropped"],
+        n_used_after_trim=ttft_s["n_used"],
     )
 
 
@@ -1698,6 +1764,20 @@ def print_summary(summary: Summary) -> None:
     print(f"{'Mean prompt len (actual)':<30}"
           f"{summary.mean_prompt_len_actual:.1f}")
     print(f"{'Mean diff':<30}{summary.mean_prompt_len_diff:+.1f}")
+    print("-" * 60)
+    print(f"{'Trim: n used after drop':<30}{summary.n_used_after_trim}")
+    print(f"  (each metric drops 1 min + 1 max before mean/percentile)")
+    print(f"{'TTFT dropped min/max':<30}"
+          f"{summary.ttft_min_dropped_ms:.2f} / {summary.ttft_max_dropped_ms:.2f}")
+    print(f"{'TPOT dropped min/max':<30}"
+          f"{summary.tpot_min_dropped_ms:.2f} / {summary.tpot_max_dropped_ms:.2f}")
+    print(f"{'TPOT* dropped min/max':<30}"
+          f"{summary.tpot_corrected_min_dropped_ms:.2f} / "
+          f"{summary.tpot_corrected_max_dropped_ms:.2f}")
+    print(f"{'ITL dropped min/max':<30}"
+          f"{summary.itl_min_dropped_ms:.2f} / {summary.itl_max_dropped_ms:.2f}")
+    print(f"{'E2E dropped min/max':<30}"
+          f"{summary.e2e_min_dropped_ms:.2f} / {summary.e2e_max_dropped_ms:.2f}")
     print("=" * 60)
 
 
