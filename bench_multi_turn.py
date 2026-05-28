@@ -172,6 +172,15 @@ class RequestRecord:
     # status
     success: bool
     error: Optional[str]
+    # streaming-derived metrics; default 0/empty so non-streaming and old
+    # consumers still work.
+    tpot_corrected_ms: float = 0.0
+    num_chunks: int = 0
+    first_chunk_tokens: int = 0
+    itl_mean_ms: float = 0.0
+    itl_p50_ms: float = 0.0
+    itl_p90_ms: float = 0.0
+    itl_p99_ms: float = 0.0
     # preview (for dump)
     prompt_ids_preview: Optional[List[int]] = None
     prompt_text_preview: Optional[str] = None
@@ -832,7 +841,7 @@ def load_conversations_from_dump(
 @dataclass
 class _TurnResult:
     ttft_ms: float
-    tpot_ms: float
+    tpot_ms: float                  # original: (last_ts - first_token_ts) / (N-1)
     e2e_ms: float
     start_ts: float
     first_token_ts: float
@@ -843,6 +852,16 @@ class _TurnResult:
     response_text: str
     success: bool
     error: Optional[str]
+    # Corrected TPOT: (last_ts - first_chunk_ts) / (N - first_chunk_tokens).
+    # The first SSE chunk often carries multiple tokens (especially under
+    # load when the server bursts post-prefill output); the original formula
+    # divides by N-1 and so undercounts per-token time. This one uses the
+    # actual number of tokens spanned by (last - first).
+    tpot_corrected_ms: float = 0.0
+    # Per-chunk arrival log for streaming responses: list of
+    # (perf_counter_ts, new_tokens_in_this_chunk). Drives ITL distribution
+    # and the corrected TPOT above.
+    chunk_arrivals: List[Tuple[float, int]] = field(default_factory=list)
 
 
 def _build_headers(cfg: Config, routing_key: Optional[str]) -> Dict[str, str]:
@@ -867,6 +886,38 @@ def _base_url(cfg: Config) -> str:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return f"http://{host}:{cfg.port}"
+
+
+def _corrected_tpot_ms(chunks: List[Tuple[float, int]]) -> float:
+    """TPOT computed against the actual token span: the first chunk
+    contributes its arrival time but its tokens don't count in the
+    denominator, because we don't know when those tokens were generated
+    individually (they arrived bundled). Matches the spirit of prom's
+    per-token histogram more closely than the (last - first)/(N-1) form."""
+    if len(chunks) < 2:
+        return 0.0
+    span_s = chunks[-1][0] - chunks[0][0]
+    tokens_after_first = sum(n for _, n in chunks[1:])
+    if span_s <= 0 or tokens_after_first <= 0:
+        return 0.0
+    return span_s * 1000.0 / tokens_after_first
+
+
+def _itl_intervals_ms(chunks: List[Tuple[float, int]]) -> List[float]:
+    """Per-token inter-token latency, in ms, derived from chunk arrivals.
+    Each chunk after the first contributes (gap / n_tokens_in_chunk)
+    repeated n_tokens_in_chunk times, so the mean across this list is
+    exactly the corrected TPOT and percentiles correspond to per-token
+    intervals (assuming tokens within a chunk are evenly spaced)."""
+    out: List[float] = []
+    for i in range(1, len(chunks)):
+        prev_ts = chunks[i - 1][0]
+        ts, n = chunks[i]
+        if n <= 0 or ts <= prev_ts:
+            continue
+        per_token = (ts - prev_ts) * 1000.0 / n
+        out.extend([per_token] * n)
+    return out
 
 
 async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
@@ -901,6 +952,7 @@ async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
     response_text = ""
     last_output_len = 0
     last_ts = start
+    chunk_arrivals: List[Tuple[float, int]] = []
     try:
         async with session.post(api_url, json=payload, headers=headers) as resp:
             if resp.status != 200:
@@ -946,6 +998,7 @@ async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
                     ttft = now - start
                     first_token_ts = now
                 if ol > last_output_len:
+                    chunk_arrivals.append((now, ol - last_output_len))
                     last_output_len = ol
                     last_ts = now
                 if text_now:
@@ -956,17 +1009,17 @@ async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
             end = time.perf_counter()
             e2e_ms = (end - start) * 1000.0
             ttft_ms = ttft * 1000.0 if ttft > 0 else e2e_ms
-            # TPOT denominator uses the LAST observed token arrival time, NOT
-            # the stream-close time. The tail between last token and socket
-            # close (server flushing meta + [DONE] + EOF) systematically
-            # inflates per-token latency, especially for short outputs.
+            # Original TPOT: kept for backward compatibility with prior CSVs.
             tpot_ms = ((last_ts - first_token_ts) * 1000.0
                        / max(1, output_len_actual - 1)) \
                 if first_token_ts > 0 and output_len_actual > 1 else 0.0
+            tpot_corr_ms = _corrected_tpot_ms(chunk_arrivals)
             return _TurnResult(ttft_ms, tpot_ms, e2e_ms, start,
                                first_token_ts, end,
                                prompt_len_actual, output_len_actual,
-                               response_ids, response_text, True, None)
+                               response_ids, response_text, True, None,
+                               tpot_corrected_ms=tpot_corr_ms,
+                               chunk_arrivals=chunk_arrivals)
     except Exception:
         end = time.perf_counter()
         return _TurnResult(0, 0, (end - start) * 1000.0, start, 0, end,
@@ -999,6 +1052,10 @@ async def _send_oai_chat(session: aiohttp.ClientSession, cfg: Config,
     output_len_actual = 0
     response_text_parts: List[str] = []
     last_ts = start
+    # OAI streaming doesn't tell us per-chunk completion_tokens, so we record
+    # one entry per content-bearing chunk and reconcile against the final
+    # usage count once we have it.
+    chunk_ts_only: List[float] = []
     try:
         async with session.post(api_url, json=payload, headers=headers) as resp:
             if resp.status != 200:
@@ -1045,6 +1102,7 @@ async def _send_oai_chat(session: aiohttp.ClientSession, cfg: Config,
                             first_token_ts = now
                         response_text_parts.append(c)
                         last_ts = now
+                        chunk_ts_only.append(now)
                 usage = data.get("usage")
                 if usage:
                     prompt_len_actual = int(usage.get("prompt_tokens") or
@@ -1054,15 +1112,30 @@ async def _send_oai_chat(session: aiohttp.ClientSession, cfg: Config,
             end = time.perf_counter()
             e2e_ms = (end - start) * 1000.0
             ttft_ms = ttft * 1000.0 if ttft > 0 else e2e_ms
-            # See native streaming branch: use last observed token timestamp,
-            # not stream-close, to avoid inflating TPOT with the meta/[DONE]/EOF tail.
+            # Original TPOT formula kept as-is.
             tpot_ms = ((last_ts - first_token_ts) * 1000.0
                        / max(1, output_len_actual - 1)) \
                 if first_token_ts > 0 and output_len_actual > 1 else 0.0
+            # Reconcile chunk count against final usage. Best-effort
+            # assumption: one token per chunk for all but the first; the
+            # first chunk absorbs whatever extra tokens prefill burst out.
+            chunk_arrivals: List[Tuple[float, int]] = []
+            n_chunks = len(chunk_ts_only)
+            if n_chunks > 0:
+                if output_len_actual >= n_chunks:
+                    first_n = output_len_actual - (n_chunks - 1)
+                else:
+                    first_n = 1
+                chunk_arrivals.append((chunk_ts_only[0], first_n))
+                for ts in chunk_ts_only[1:]:
+                    chunk_arrivals.append((ts, 1))
+            tpot_corr_ms = _corrected_tpot_ms(chunk_arrivals)
             return _TurnResult(ttft_ms, tpot_ms, e2e_ms, start,
                                first_token_ts, end,
                                prompt_len_actual, output_len_actual,
-                               [], "".join(response_text_parts), True, None)
+                               [], "".join(response_text_parts), True, None,
+                               tpot_corrected_ms=tpot_corr_ms,
+                               chunk_arrivals=chunk_arrivals)
     except Exception:
         end = time.perf_counter()
         return _TurnResult(0, 0, (end - start) * 1000.0, start, 0, end,
@@ -1130,6 +1203,10 @@ async def _run_conversation(
                                                  conv.routing_key)
 
         # --- record -------------------------------------------------------
+        itls = _itl_intervals_ms(result.chunk_arrivals)
+        first_chunk_tokens = (
+            result.chunk_arrivals[0][1] if result.chunk_arrivals else 0
+        )
         rec = RequestRecord(
             group_id=conv.group_id,
             conv_id=conv.conv_id,
@@ -1146,6 +1223,13 @@ async def _run_conversation(
             e2e_ms=result.e2e_ms,
             success=result.success,
             error=result.error,
+            tpot_corrected_ms=result.tpot_corrected_ms,
+            num_chunks=len(result.chunk_arrivals),
+            first_chunk_tokens=first_chunk_tokens,
+            itl_mean_ms=float(np.mean(itls)) if itls else 0.0,
+            itl_p50_ms=_percentile(itls, 50),
+            itl_p90_ms=_percentile(itls, 90),
+            itl_p99_ms=_percentile(itls, 99),
         )
         if dump_requests_writer is not None:
             preview_ids = None
@@ -1347,6 +1431,20 @@ class Summary:
     median_tpot_ms: float
     p90_tpot_ms: float
     p99_tpot_ms: float
+    # Corrected TPOT — denominator excludes the bundled first-chunk tokens.
+    mean_tpot_corrected_ms: float
+    median_tpot_corrected_ms: float
+    p90_tpot_corrected_ms: float
+    p99_tpot_corrected_ms: float
+    # Inter-token latency aggregated across all chunk gaps from all
+    # successful requests; closest analogue to prom's per-token histogram.
+    mean_itl_ms: float
+    median_itl_ms: float
+    p90_itl_ms: float
+    p99_itl_ms: float
+    # Streaming diagnostics — helps explain TPOT discrepancies.
+    mean_first_chunk_tokens: float
+    mean_tokens_per_chunk: float
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     p90_e2e_latency_ms: float
@@ -1361,11 +1459,25 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
     ok = [r for r in records if r.success]
     ttfts = [r.ttft_ms for r in ok]
     tpots = [r.tpot_ms for r in ok if r.tpot_ms > 0]
+    tpot_corrs = [r.tpot_corrected_ms for r in ok if r.tpot_corrected_ms > 0]
     e2es = [r.e2e_ms for r in ok]
     prompt_exp = [r.prompt_len_expected for r in ok]
     prompt_act = [r.prompt_len_actual for r in ok if r.prompt_len_actual > 0]
     output_act_sum = sum(r.output_len_actual for r in ok)
     input_act_sum = sum(r.prompt_len_actual for r in ok)
+    # Aggregate ITL across requests by averaging per-request percentiles
+    # (per-token raw intervals would need re-collection; per-request
+    # percentiles are a fine proxy and cheap to compute).
+    itl_means = [r.itl_mean_ms for r in ok if r.itl_mean_ms > 0]
+    itl_p50s = [r.itl_p50_ms for r in ok if r.itl_p50_ms > 0]
+    itl_p90s = [r.itl_p90_ms for r in ok if r.itl_p90_ms > 0]
+    itl_p99s = [r.itl_p99_ms for r in ok if r.itl_p99_ms > 0]
+    first_chunk_toks = [r.first_chunk_tokens for r in ok if r.num_chunks > 0]
+    tokens_per_chunk = [
+        r.output_len_actual / r.num_chunks
+        for r in ok
+        if r.num_chunks > 0 and r.output_len_actual > 0
+    ]
 
     duration = max(duration_s, 1e-9)
     req_tp = len(ok) / duration
@@ -1420,6 +1532,16 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         median_tpot_ms=_percentile(tpots, 50),
         p90_tpot_ms=_percentile(tpots, 90),
         p99_tpot_ms=_percentile(tpots, 99),
+        mean_tpot_corrected_ms=float(np.mean(tpot_corrs)) if tpot_corrs else 0.0,
+        median_tpot_corrected_ms=_percentile(tpot_corrs, 50),
+        p90_tpot_corrected_ms=_percentile(tpot_corrs, 90),
+        p99_tpot_corrected_ms=_percentile(tpot_corrs, 99),
+        mean_itl_ms=float(np.mean(itl_means)) if itl_means else 0.0,
+        median_itl_ms=float(np.mean(itl_p50s)) if itl_p50s else 0.0,
+        p90_itl_ms=float(np.mean(itl_p90s)) if itl_p90s else 0.0,
+        p99_itl_ms=float(np.mean(itl_p99s)) if itl_p99s else 0.0,
+        mean_first_chunk_tokens=float(np.mean(first_chunk_toks)) if first_chunk_toks else 0.0,
+        mean_tokens_per_chunk=float(np.mean(tokens_per_chunk)) if tokens_per_chunk else 0.0,
         mean_e2e_latency_ms=float(np.mean(e2es)) if e2es else 0.0,
         median_e2e_latency_ms=_percentile(e2es, 50),
         p90_e2e_latency_ms=_percentile(e2es, 90),
@@ -1553,6 +1675,19 @@ def print_summary(summary: Summary) -> None:
     print(f"{'Median TPOT (ms)':<30}{summary.median_tpot_ms:.2f}")
     print(f"{'P90 TPOT (ms)':<30}{summary.p90_tpot_ms:.2f}")
     print(f"{'P99 TPOT (ms)':<30}{summary.p99_tpot_ms:.2f}")
+    print(f"{'Mean TPOT* (ms)':<30}{summary.mean_tpot_corrected_ms:.2f}")
+    print(f"{'Median TPOT* (ms)':<30}{summary.median_tpot_corrected_ms:.2f}")
+    print(f"{'P90 TPOT* (ms)':<30}{summary.p90_tpot_corrected_ms:.2f}")
+    print(f"{'P99 TPOT* (ms)':<30}{summary.p99_tpot_corrected_ms:.2f}")
+    print(f"{'Mean ITL (ms)':<30}{summary.mean_itl_ms:.2f}")
+    print(f"{'Median ITL (ms)':<30}{summary.median_itl_ms:.2f}")
+    print(f"{'P90 ITL (ms)':<30}{summary.p90_itl_ms:.2f}")
+    print(f"{'P99 ITL (ms)':<30}{summary.p99_itl_ms:.2f}")
+    print(f"{'Mean first-chunk tokens':<30}"
+          f"{summary.mean_first_chunk_tokens:.2f}")
+    print(f"{'Mean tokens/chunk':<30}{summary.mean_tokens_per_chunk:.2f}")
+    print("  (TPOT* uses (last - first) / (N - first_chunk_tokens); ITL is "
+          "per-token spread.)")
     print(f"{'Mean E2E (ms)':<30}{summary.mean_e2e_latency_ms:.2f}")
     print(f"{'Median E2E (ms)':<30}{summary.median_e2e_latency_ms:.2f}")
     print(f"{'P90 E2E (ms)':<30}{summary.p90_e2e_latency_ms:.2f}")
