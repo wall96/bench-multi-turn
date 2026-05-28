@@ -48,7 +48,19 @@ PROFILES=(
 )
 
 CONCURRENCIES=(4 8 16 24)
+
+# Cooldown between cells: flush KV / radix cache, sleep, then next run.
+# Avoids one cell's residual cache helping the next one.
+COOLDOWN_SEC=10
+FLUSH_URL="http://$HOST:$PORT/flush_cache"
 # =========================
+
+cooldown() {
+  echo ">>> flushing cache + sleep ${COOLDOWN_SEC}s" | tee -a "$LOG"
+  curl -s -X POST "$FLUSH_URL" >> "$LOG" 2>&1 \
+    || echo "!! flush_cache failed (server may not expose /flush_cache)" | tee -a "$LOG"
+  sleep "$COOLDOWN_SEC"
+}
 
 : > "$LOG"
 echo "Sweep start: $(date)" | tee -a "$LOG"
@@ -102,6 +114,7 @@ for prof in "${PROFILES[@]}"; do
     fi
 
     echo "=== done $case_name ===" | tee -a "$LOG"
+    cooldown
   done
 done
 
