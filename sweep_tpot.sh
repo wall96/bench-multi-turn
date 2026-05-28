@@ -23,7 +23,7 @@ set -uo pipefail
 # ====== EDIT THESE ======
 HOST=localhost
 PORT=30000
-MODEL=/data/GLM-5-FP8/
+MODEL=/gpfs/models/huggingface.co/deepseek-ai/DeepSeek-V3.2
 TOKENIZER=$MODEL
 SHAREGPT_PATH=/workspace/infrawaves/zq/ShareGPT_V3_unfiltered_cleaned_split.json
 SCRIPT=./bench_multi_turn.py
@@ -53,6 +53,10 @@ echo "Rates: ${RATES[*]}"   | tee -a "$LOG"
 first=1
 for r in "${RATES[@]}"; do
   echo "=== request-rate=$r ===" | tee -a "$LOG"
+
+  echo "flushing cache..." | tee -a "$LOG"
+  curl -s -X POST "http://${HOST}:${PORT}/flush_cache" >> "$LOG" 2>&1 \
+    || echo "!! flush_cache failed for rate=$r" | tee -a "$LOG"
 
   if [[ $first -eq 1 ]]; then
     # First run: build the dataset from ShareGPT, dump it, also primes
@@ -85,6 +89,7 @@ for r in "${RATES[@]}"; do
   fi
 
   echo "=== done rate=$r ===" | tee -a "$LOG"
+  sleep 15
 done
 
 echo "All sweeps done: $(date)" | tee -a "$LOG"
