@@ -44,11 +44,50 @@ LOG=./bench.log
 
 # rates: 0.2,0.4,...,1.0 then 1.5,2.0,...,5.0
 RATES=(0.2 0.4 0.6 0.8 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0)
+
+# ====== Server-side metrics (optional, bypasses prom server) ======
+# When set, snapshots /metrics on each listed server before+after every
+# rate point and computes histogram_quantile exactly like grafana does
+# server-side. Output goes to a separate CSV so the existing
+# client-side CSV is untouched.
+# Empty = disabled.
+SERVER_METRICS_URLS=""   # e.g. "http://10.51.10.32:30000/metrics,http://10.51.10.33:30000/metrics"
+SERVER_METRICS_CSV="./server_metrics.csv"
+SERVER_METRICS_LABEL_FILTERS=()  # add as: ("--label-filter" "model_name=DeepSeek-V3.2-4decode-only" ...)
+SERVER_METRICS_POST_SLEEP=5
 # =========================
 
 : > "$LOG"
 echo "Sweep start: $(date)" | tee -a "$LOG"
 echo "Rates: ${RATES[*]}"   | tee -a "$LOG"
+
+# Build the bench command for one rate point. Echoed as a single string
+# so we can hand it to either python3 directly or to server_metrics.py wrap.
+build_cmd() {
+  local rate="$1" first="$2"
+  if [[ $first -eq 1 ]]; then
+    echo python3 "$SCRIPT" \
+      --backend sglang --host "$HOST" --port "$PORT" \
+      --model "$MODEL" --tokenizer "$TOKENIZER" \
+      --dataset-mode sharegpt --sharegpt-path "$SHAREGPT_PATH" \
+      --num-groups "$NUM_GROUPS" --prompts-per-group "$PROMPTS_PER_GROUP" \
+      --num-turns "$NUM_TURNS" \
+      --system-prompt-len "$SYS_LEN" --question-len "$Q_LEN" --output-len "$OUT_LEN" \
+      --seed "$SEED" \
+      --request-rate "$rate" --max-concurrency 256 \
+      --dump-prompts-dir "$DUMP_DIR" --dump-full-content \
+      --extra-request-body "$EXTRA_BODY" \
+      --case-name "r${rate}" --summary-csv "$SUMMARY_CSV"
+  else
+    echo python3 "$SCRIPT" \
+      --backend sglang --host "$HOST" --port "$PORT" \
+      --model "$MODEL" --tokenizer "$TOKENIZER" \
+      --load-dataset "$DUMP_DIR/content.jsonl" \
+      --request-rate "$rate" --max-concurrency 256 \
+      --extra-request-body "$EXTRA_BODY" \
+      --case-name "r${rate}" --summary-csv "$SUMMARY_CSV"
+  fi
+}
 
 first=1
 for r in "${RATES[@]}"; do
@@ -58,40 +97,36 @@ for r in "${RATES[@]}"; do
   curl -s -X POST "http://${HOST}:${PORT}/flush_cache" >> "$LOG" 2>&1 \
     || echo "!! flush_cache failed for rate=$r" | tee -a "$LOG"
 
-  if [[ $first -eq 1 ]]; then
-    # First run: build the dataset from ShareGPT, dump it, also primes
-    # the prefix cache for subsequent runs.
-    python3 "$SCRIPT" \
-      --backend sglang --host "$HOST" --port "$PORT" \
-      --model "$MODEL" --tokenizer "$TOKENIZER" \
-      --dataset-mode sharegpt --sharegpt-path "$SHAREGPT_PATH" \
-      --num-groups $NUM_GROUPS --prompts-per-group $PROMPTS_PER_GROUP \
-      --num-turns $NUM_TURNS \
-      --system-prompt-len $SYS_LEN --question-len $Q_LEN --output-len $OUT_LEN \
-      --seed $SEED \
-      --request-rate "$r" --max-concurrency 256 \
-      --dump-prompts-dir "$DUMP_DIR" --dump-full-content \
-      --extra-request-body "$EXTRA_BODY" \
-      --case-name "r${r}" --summary-csv "$SUMMARY_CSV" \
-      >> "$LOG" 2>&1 || echo "!! rate=$r returned non-zero (some requests likely failed)" | tee -a "$LOG"
-    first=0
+  bench_cmd=$(build_cmd "$r" "$first")
+
+  if [[ -n "$SERVER_METRICS_URLS" ]]; then
+    # Wrap the bench run with server-side metric snapshotting.
+    # ITL / TTFT / E2E percentiles get appended to SERVER_METRICS_CSV.
+    python3 ./server_metrics.py wrap \
+      --metrics-urls "$SERVER_METRICS_URLS" \
+      --metric ITL=sglang:inter_token_latency_seconds \
+      --metric TTFT=sglang:time_to_first_token_seconds \
+      --metric E2E=sglang:e2e_request_latency_seconds \
+      --quantiles 0.5,0.9,0.99 \
+      --case-name "r${r}" \
+      --summary-csv "$SERVER_METRICS_CSV" \
+      --post-sleep "$SERVER_METRICS_POST_SLEEP" \
+      "${SERVER_METRICS_LABEL_FILTERS[@]}" \
+      -- bash -c "$bench_cmd" \
+      >> "$LOG" 2>&1 \
+      || echo "!! rate=$r returned non-zero (some requests likely failed)" | tee -a "$LOG"
   else
-    # Subsequent runs: reload the exact same prompts so all rates are
-    # comparable, only the arrival rate changes.
-    python3 "$SCRIPT" \
-      --backend sglang --host "$HOST" --port "$PORT" \
-      --model "$MODEL" --tokenizer "$TOKENIZER" \
-      --load-dataset "$DUMP_DIR/content.jsonl" \
-      --request-rate "$r" --max-concurrency 256 \
-      --extra-request-body "$EXTRA_BODY" \
-      --case-name "r${r}" --summary-csv "$SUMMARY_CSV" \
-      >> "$LOG" 2>&1 || echo "!! rate=$r returned non-zero (some requests likely failed)" | tee -a "$LOG"
+    eval "$bench_cmd" >> "$LOG" 2>&1 \
+      || echo "!! rate=$r returned non-zero (some requests likely failed)" | tee -a "$LOG"
   fi
+
+  if [[ $first -eq 1 ]]; then first=0; fi
 
   echo "=== done rate=$r ===" | tee -a "$LOG"
   sleep 15
 done
 
 echo "All sweeps done: $(date)" | tee -a "$LOG"
-echo "Summary CSV: $SUMMARY_CSV"
-echo "Full log:    $LOG"
+echo "Summary CSV (client):  $SUMMARY_CSV"
+[[ -n "$SERVER_METRICS_URLS" ]] && echo "Summary CSV (server):  $SERVER_METRICS_CSV"
+echo "Full log:              $LOG"
