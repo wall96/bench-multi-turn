@@ -32,8 +32,11 @@ PROMPTS_PER_GROUP=50    # 50 requests per (profile, concurrency) cell
 NUM_TURNS=1
 SEED=42
 
-# Decode-only / fake-prefill server. Set to '' if your server is normal.
-EXTRA_BODY='{"bootstrap_host": "2.2.2.2", "bootstrap_room": 0}'
+# Extra JSON merged into every request payload. Leave empty for a normal
+# full-stack server. Set to fake-prefill bootstrap fields when testing a
+# decode-only server, e.g.
+#   EXTRA_BODY='{"bootstrap_host": "2.2.2.2", "bootstrap_room": 0}'
+EXTRA_BODY=''
 
 DUMP_BASE=./dump_isl_osl
 SUMMARY_CSV=./isl_osl_sweep.csv
@@ -97,7 +100,7 @@ for prof in "${PROFILES[@]}"; do
         --seed $SEED \
         --max-concurrency $conc \
         --dump-prompts-dir "$dump_dir" --dump-full-content \
-        --extra-request-body "$EXTRA_BODY" \
+        ${EXTRA_BODY:+--extra-request-body "$EXTRA_BODY"} \
         --case-name "$case_name" --summary-csv "$SUMMARY_CSV" \
         >> "$LOG" 2>&1 \
         || echo "!! $case_name returned non-zero" | tee -a "$LOG"
@@ -109,7 +112,7 @@ for prof in "${PROFILES[@]}"; do
         --model "$MODEL" --tokenizer "$TOKENIZER" \
         --load-dataset "$dump_dir/content.jsonl" \
         --max-concurrency $conc \
-        --extra-request-body "$EXTRA_BODY" \
+        ${EXTRA_BODY:+--extra-request-body "$EXTRA_BODY"} \
         --case-name "$case_name" --summary-csv "$SUMMARY_CSV" \
         >> "$LOG" 2>&1 \
         || echo "!! $case_name returned non-zero" | tee -a "$LOG"
