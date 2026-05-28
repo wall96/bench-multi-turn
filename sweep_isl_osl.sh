@@ -56,7 +56,8 @@ FLUSH_URL="http://$HOST:$PORT/flush_cache"
 # =========================
 
 cooldown() {
-  echo ">>> flushing cache + sleep ${COOLDOWN_SEC}s" | tee -a "$LOG"
+  # Run BEFORE each cell so every test starts from a clean cache state.
+  echo ">>> flush_cache + sleep ${COOLDOWN_SEC}s before next cell" | tee -a "$LOG"
   curl -s -X POST "$FLUSH_URL" >> "$LOG" 2>&1 \
     || echo "!! flush_cache failed (server may not expose /flush_cache)" | tee -a "$LOG"
   sleep "$COOLDOWN_SEC"
@@ -82,6 +83,7 @@ for prof in "${PROFILES[@]}"; do
   for conc in "${CONCURRENCIES[@]}"; do
     case_name="${name}_c${conc}"
     echo "=== $case_name ===" | tee -a "$LOG"
+    cooldown
 
     if [[ $first -eq 1 ]]; then
       # First concurrency for this profile: build prompts from ShareGPT, dump them.
@@ -114,7 +116,6 @@ for prof in "${PROFILES[@]}"; do
     fi
 
     echo "=== done $case_name ===" | tee -a "$LOG"
-    cooldown
   done
 done
 
