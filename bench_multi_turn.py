@@ -956,7 +956,11 @@ async def _send_native_generate(session: aiohttp.ClientSession, cfg: Config,
             end = time.perf_counter()
             e2e_ms = (end - start) * 1000.0
             ttft_ms = ttft * 1000.0 if ttft > 0 else e2e_ms
-            tpot_ms = ((end - first_token_ts) * 1000.0
+            # TPOT denominator uses the LAST observed token arrival time, NOT
+            # the stream-close time. The tail between last token and socket
+            # close (server flushing meta + [DONE] + EOF) systematically
+            # inflates per-token latency, especially for short outputs.
+            tpot_ms = ((last_ts - first_token_ts) * 1000.0
                        / max(1, output_len_actual - 1)) \
                 if first_token_ts > 0 and output_len_actual > 1 else 0.0
             return _TurnResult(ttft_ms, tpot_ms, e2e_ms, start,
@@ -1050,7 +1054,9 @@ async def _send_oai_chat(session: aiohttp.ClientSession, cfg: Config,
             end = time.perf_counter()
             e2e_ms = (end - start) * 1000.0
             ttft_ms = ttft * 1000.0 if ttft > 0 else e2e_ms
-            tpot_ms = ((end - first_token_ts) * 1000.0
+            # See native streaming branch: use last observed token timestamp,
+            # not stream-close, to avoid inflating TPOT with the meta/[DONE]/EOF tail.
+            tpot_ms = ((last_ts - first_token_ts) * 1000.0
                        / max(1, output_len_actual - 1)) \
                 if first_token_ts > 0 and output_len_actual > 1 else 0.0
             return _TurnResult(ttft_ms, tpot_ms, e2e_ms, start,
@@ -1323,17 +1329,26 @@ class Summary:
     completed: int
     failed: int
     duration_s: float
+    # Active span = max(end_ts) - min(start_ts) across successful requests.
+    # Excludes idle padding before the first request and after the last one,
+    # so it lines up with what Prometheus shows during the actual load window.
+    active_duration_s: float
     request_throughput: float
     input_throughput: float
     output_throughput: float
+    request_throughput_active: float
+    input_throughput_active: float
+    output_throughput_active: float
     mean_ttft_ms: float
     median_ttft_ms: float
+    p90_ttft_ms: float
     p99_ttft_ms: float
     mean_tpot_ms: float
     median_tpot_ms: float
     p90_tpot_ms: float
     p99_tpot_ms: float
     mean_e2e_latency_ms: float
+    median_e2e_latency_ms: float
     p90_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     mean_prompt_len_expected: float
@@ -1357,6 +1372,21 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
     in_tp = input_act_sum / duration
     out_tp = output_act_sum / duration
 
+    # Active span: from the first successful request's send time to the last
+    # successful request's completion. Throughputs computed against this span
+    # exclude the idle warm-up/teardown lag and line up with Prometheus
+    # (which only sees the server-side window where work was actually
+    # happening).
+    if ok:
+        active_dur = max(max(r.end_ts for r in ok) - min(r.start_ts for r in ok),
+                         1e-9)
+    else:
+        active_dur = 0.0
+    active_dur_safe = max(active_dur, 1e-9)
+    req_tp_act = len(ok) / active_dur_safe
+    in_tp_act = input_act_sum / active_dur_safe
+    out_tp_act = output_act_sum / active_dur_safe
+
     mean_exp = float(np.mean(prompt_exp)) if prompt_exp else 0.0
     mean_act = float(np.mean(prompt_act)) if prompt_act else 0.0
 
@@ -1375,17 +1405,23 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         completed=len(ok),
         failed=len(records) - len(ok),
         duration_s=duration_s,
+        active_duration_s=active_dur,
         request_throughput=req_tp,
         input_throughput=in_tp,
         output_throughput=out_tp,
+        request_throughput_active=req_tp_act,
+        input_throughput_active=in_tp_act,
+        output_throughput_active=out_tp_act,
         mean_ttft_ms=float(np.mean(ttfts)) if ttfts else 0.0,
         median_ttft_ms=_percentile(ttfts, 50),
+        p90_ttft_ms=_percentile(ttfts, 90),
         p99_ttft_ms=_percentile(ttfts, 99),
         mean_tpot_ms=float(np.mean(tpots)) if tpots else 0.0,
         median_tpot_ms=_percentile(tpots, 50),
         p90_tpot_ms=_percentile(tpots, 90),
         p99_tpot_ms=_percentile(tpots, 99),
         mean_e2e_latency_ms=float(np.mean(e2es)) if e2es else 0.0,
+        median_e2e_latency_ms=_percentile(e2es, 50),
         p90_e2e_latency_ms=_percentile(e2es, 90),
         p99_e2e_latency_ms=_percentile(e2es, 99),
         mean_prompt_len_expected=mean_exp,
@@ -1497,19 +1533,28 @@ def print_summary(summary: Summary) -> None:
     print(f"{'Case':<30}{summary.case_name}")
     print(f"{'Completed / total':<30}"
           f"{summary.completed} / {summary.completed + summary.failed}")
-    print(f"{'Duration (s)':<30}{summary.duration_s:.2f}")
-    print(f"{'Request throughput (req/s)':<30}{summary.request_throughput:.3f}")
-    print(f"{'Input throughput (tok/s)':<30}{summary.input_throughput:.1f}")
-    print(f"{'Output throughput (tok/s)':<30}{summary.output_throughput:.1f}")
+    print(f"{'Duration wall (s)':<30}{summary.duration_s:.2f}")
+    print(f"{'Duration active (s)':<30}{summary.active_duration_s:.2f}")
+    print(f"{'Req throughput wall (r/s)':<30}{summary.request_throughput:.3f}")
+    print(f"{'Req throughput active (r/s)':<30}"
+          f"{summary.request_throughput_active:.3f}")
+    print(f"{'In throughput wall (tok/s)':<30}{summary.input_throughput:.1f}")
+    print(f"{'In throughput active (tok/s)':<30}"
+          f"{summary.input_throughput_active:.1f}")
+    print(f"{'Out throughput wall (tok/s)':<30}{summary.output_throughput:.1f}")
+    print(f"{'Out throughput active (tok/s)':<30}"
+          f"{summary.output_throughput_active:.1f}")
     print("-" * 60)
     print(f"{'Mean TTFT (ms)':<30}{summary.mean_ttft_ms:.2f}")
     print(f"{'Median TTFT (ms)':<30}{summary.median_ttft_ms:.2f}")
+    print(f"{'P90 TTFT (ms)':<30}{summary.p90_ttft_ms:.2f}")
     print(f"{'P99 TTFT (ms)':<30}{summary.p99_ttft_ms:.2f}")
     print(f"{'Mean TPOT (ms)':<30}{summary.mean_tpot_ms:.2f}")
     print(f"{'Median TPOT (ms)':<30}{summary.median_tpot_ms:.2f}")
     print(f"{'P90 TPOT (ms)':<30}{summary.p90_tpot_ms:.2f}")
     print(f"{'P99 TPOT (ms)':<30}{summary.p99_tpot_ms:.2f}")
     print(f"{'Mean E2E (ms)':<30}{summary.mean_e2e_latency_ms:.2f}")
+    print(f"{'Median E2E (ms)':<30}{summary.median_e2e_latency_ms:.2f}")
     print(f"{'P90 E2E (ms)':<30}{summary.p90_e2e_latency_ms:.2f}")
     print(f"{'P99 E2E (ms)':<30}{summary.p99_e2e_latency_ms:.2f}")
     print("-" * 60)
