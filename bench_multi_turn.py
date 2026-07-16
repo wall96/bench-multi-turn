@@ -102,7 +102,7 @@ class Config:
     num_prompts: int
     max_concurrency: int
     request_rate: float
-    ordered: bool
+    send_order: str  # "shuffle" | "group" | "round-robin"
     # multi-turn
     replay_real_response: bool
     # outputs
@@ -178,9 +178,12 @@ class RequestRecord:
     num_chunks: int = 0
     first_chunk_tokens: int = 0
     itl_mean_ms: float = 0.0
-    itl_p50_ms: float = 0.0
-    itl_p90_ms: float = 0.0
-    itl_p99_ms: float = 0.0
+    # Raw per-token inter-token latencies (ms): one entry per generated token
+    # after the first. Kept as the full list (not pre-reduced to per-request
+    # percentiles) so the summary can pool every token's ITL across all
+    # requests and take true overall percentiles. Note: this makes the
+    # per-request jsonl grow ~linearly with output_len.
+    itls_ms: List[float] = field(default_factory=list)
     # preview (for dump)
     prompt_ids_preview: Optional[List[int]] = None
     prompt_text_preview: Optional[str] = None
@@ -254,8 +257,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-concurrency", type=int, default=16)
     p.add_argument("--request-rate", type=float, default=float("inf"),
                    help="Max requests per second; inf = unlimited.")
+    p.add_argument("--send-order", choices=["shuffle", "group", "round-robin"],
+                   default="shuffle",
+                   help="Request dispatch order. 'shuffle' (default): random; "
+                        "'group': all convs in group 0, then group 1, ...; "
+                        "'round-robin': interleave groups g0,g1,...,g0,g1,...")
     p.add_argument("--ordered", action="store_true",
-                   help="Send requests in group order; default is shuffled.")
+                   help="Alias for --send-order=group (kept for backward compat).")
     # multi-turn
     p.add_argument("--replay-real-response", action="store_true",
                    help="Option B: build next turn's prompt from real model response.")
@@ -339,7 +347,7 @@ def args_to_config(args: argparse.Namespace) -> Config:
         num_prompts=num_prompts,
         max_concurrency=args.max_concurrency,
         request_rate=args.request_rate,
-        ordered=args.ordered,
+        send_order="group" if args.ordered else args.send_order,
         replay_real_response=args.replay_real_response,
         output_file=args.output_file,
         summary_csv=args.summary_csv,
@@ -1227,9 +1235,7 @@ async def _run_conversation(
             num_chunks=len(result.chunk_arrivals),
             first_chunk_tokens=first_chunk_tokens,
             itl_mean_ms=float(np.mean(itls)) if itls else 0.0,
-            itl_p50_ms=_percentile(itls, 50),
-            itl_p90_ms=_percentile(itls, 90),
-            itl_p99_ms=_percentile(itls, 99),
+            itls_ms=itls,
         )
         if dump_requests_writer is not None:
             preview_ids = None
@@ -1291,6 +1297,22 @@ async def _run_conversation(
 # Scheduler: concurrency + rate + shuffle
 # --------------------------------------------------------------------------- #
 
+def _round_robin_order(conversations: List[Conversation]) -> List[Conversation]:
+    """Reorder conversations so groups are interleaved: g0,g1,...,g0,g1,..."""
+    from collections import defaultdict
+    groups: Dict[int, List[Conversation]] = defaultdict(list)
+    for conv in conversations:
+        groups[conv.group_id].append(conv)
+    group_ids = sorted(groups.keys())
+    result: List[Conversation] = []
+    max_len = max((len(v) for v in groups.values()), default=0)
+    for i in range(max_len):
+        for gid in group_ids:
+            if i < len(groups[gid]):
+                result.append(groups[gid][i])
+    return result
+
+
 async def _conversation_arrival(conversations: List[Conversation],
                                 request_rate: float,
                                 num_turns: int):
@@ -1315,9 +1337,12 @@ async def run_benchmark(cfg: Config, tokenizer,
                         conversations: List[Conversation]) -> Tuple[
                             List[RequestRecord], float]:
     # ordering
-    if not cfg.ordered:
+    if cfg.send_order == "round-robin":
+        conversations = _round_robin_order(conversations)
+    elif cfg.send_order == "shuffle":
         rng = random.Random(cfg.seed + 101)
         rng.shuffle(conversations)
+    # else "group": keep natural generation order (all g0, then g1, ...)
 
     # cap total requests via trimming turns
     total_target = cfg.num_prompts
@@ -1350,7 +1375,7 @@ async def run_benchmark(cfg: Config, tokenizer,
 
     connector = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_TIMEOUT_SEC)
-    all_records: List[RequestRecord] = []
+    all_records_by_idx: List[Optional[List[RequestRecord]]] = []
 
     total_turns = sum(len(c.turns) for c in conversations)
     pbar = tqdm(total=total_turns, desc="turns")
@@ -1363,20 +1388,26 @@ async def run_benchmark(cfg: Config, tokenizer,
         read_bufsize=AIOHTTP_READ_BUFSIZE,
     ) as session:
 
-        async def _one_conv(conv: Conversation):
+        async def _one_conv(conv: Conversation, idx: int):
             async with semaphore:
                 recs = await _run_conversation(
                     session, cfg, conv, tokenizer, dump_requests_fp, pbar,
                 )
-                all_records.extend(recs)
+                all_records_by_idx[idx] = recs
 
         tasks: List[asyncio.Task] = []
         async for conv in _conversation_arrival(
             conversations, cfg.request_rate, cfg.num_turns
         ):
-            tasks.append(asyncio.create_task(_one_conv(conv)))
+            idx = len(all_records_by_idx)
+            all_records_by_idx.append(None)
+            tasks.append(asyncio.create_task(_one_conv(conv, idx)))
         if tasks:
             await asyncio.gather(*tasks)
+
+    all_records: List[RequestRecord] = [
+        r for slot in all_records_by_idx if slot for r in slot
+    ]
 
     pbar.close()
     duration_s = time.perf_counter() - t_start
@@ -1463,12 +1494,15 @@ class Summary:
     median_tpot_corrected_ms: float
     p90_tpot_corrected_ms: float
     p99_tpot_corrected_ms: float
-    # Inter-token latency aggregated across all chunk gaps from all
-    # successful requests; closest analogue to prom's per-token histogram.
+    # Inter-token latency pooled over EVERY generated token across ALL
+    # successful requests (token-weighted global percentiles), matching
+    # sglang's calculate_metrics. No min/max trim is applied to ITL.
     mean_itl_ms: float
     median_itl_ms: float
     p90_itl_ms: float
     p99_itl_ms: float
+    max_itl_ms: float
+    itl_num_tokens: int
     # Streaming diagnostics — helps explain TPOT discrepancies.
     mean_first_chunk_tokens: float
     mean_tokens_per_chunk: float
@@ -1491,8 +1525,6 @@ class Summary:
     tpot_corrected_max_dropped_ms: float
     e2e_min_dropped_ms: float
     e2e_max_dropped_ms: float
-    itl_min_dropped_ms: float
-    itl_max_dropped_ms: float
     n_used_after_trim: int
 
 
@@ -1507,13 +1539,12 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
     prompt_act = [r.prompt_len_actual for r in ok if r.prompt_len_actual > 0]
     output_act_sum = sum(r.output_len_actual for r in ok)
     input_act_sum = sum(r.prompt_len_actual for r in ok)
-    # Aggregate ITL across requests by averaging per-request percentiles
-    # (per-token raw intervals would need re-collection; per-request
-    # percentiles are a fine proxy and cheap to compute).
-    itl_means = [r.itl_mean_ms for r in ok if r.itl_mean_ms > 0]
-    itl_p50s = [r.itl_p50_ms for r in ok if r.itl_p50_ms > 0]
-    itl_p90s = [r.itl_p90_ms for r in ok if r.itl_p90_ms > 0]
-    itl_p99s = [r.itl_p99_ms for r in ok if r.itl_p99_ms > 0]
+    # Global ITL pool: concatenate every per-token interval from every
+    # successful request into one flat list. Percentiles below are then true
+    # overall quantiles (each token weighted equally, so long responses
+    # contribute proportionally more samples) rather than an average of
+    # per-request percentiles.
+    all_itls = [x for r in ok for x in r.itls_ms]
     first_chunk_toks = [r.first_chunk_tokens for r in ok if r.num_chunks > 0]
     tokens_per_chunk = [
         r.output_len_actual / r.num_chunks
@@ -1534,10 +1565,6 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
     tpot_s = _trim_stats(tpots)
     tpot_corr_s = _trim_stats(tpot_corrs)
     e2e_s = _trim_stats(e2es)
-    itl_mean_s = _trim_stats(itl_means)
-    itl_p50_s = _trim_stats(itl_p50s)
-    itl_p90_s = _trim_stats(itl_p90s)
-    itl_p99_s = _trim_stats(itl_p99s)
 
     # Active span: from the first successful request's send time to the last
     # successful request's completion. Throughputs computed against this span
@@ -1591,10 +1618,12 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         median_tpot_corrected_ms=tpot_corr_s["p50"],
         p90_tpot_corrected_ms=tpot_corr_s["p90"],
         p99_tpot_corrected_ms=tpot_corr_s["p99"],
-        mean_itl_ms=itl_mean_s["mean"],
-        median_itl_ms=itl_p50_s["mean"],
-        p90_itl_ms=itl_p90_s["mean"],
-        p99_itl_ms=itl_p99_s["mean"],
+        mean_itl_ms=float(np.mean(all_itls)) if all_itls else 0.0,
+        median_itl_ms=_percentile(all_itls, 50),
+        p90_itl_ms=_percentile(all_itls, 90),
+        p99_itl_ms=_percentile(all_itls, 99),
+        max_itl_ms=float(np.max(all_itls)) if all_itls else 0.0,
+        itl_num_tokens=len(all_itls),
         mean_first_chunk_tokens=float(np.mean(first_chunk_toks)) if first_chunk_toks else 0.0,
         mean_tokens_per_chunk=float(np.mean(tokens_per_chunk)) if tokens_per_chunk else 0.0,
         mean_e2e_latency_ms=e2e_s["mean"],
@@ -1612,8 +1641,6 @@ def _compute_summary(cfg: Config, records: List[RequestRecord],
         tpot_corrected_max_dropped_ms=tpot_corr_s["max_dropped"],
         e2e_min_dropped_ms=e2e_s["min_dropped"],
         e2e_max_dropped_ms=e2e_s["max_dropped"],
-        itl_min_dropped_ms=itl_mean_s["min_dropped"],
-        itl_max_dropped_ms=itl_mean_s["max_dropped"],
         n_used_after_trim=ttft_s["n_used"],
     )
 
@@ -1749,6 +1776,9 @@ def print_summary(summary: Summary) -> None:
     print(f"{'Median ITL (ms)':<30}{summary.median_itl_ms:.2f}")
     print(f"{'P90 ITL (ms)':<30}{summary.p90_itl_ms:.2f}")
     print(f"{'P99 ITL (ms)':<30}{summary.p99_itl_ms:.2f}")
+    print(f"{'Max ITL (ms)':<30}{summary.max_itl_ms:.2f}")
+    print(f"  (ITL pooled over {summary.itl_num_tokens} tokens across all "
+          f"requests; global percentiles, no trim.)")
     print(f"{'Mean first-chunk tokens':<30}"
           f"{summary.mean_first_chunk_tokens:.2f}")
     print(f"{'Mean tokens/chunk':<30}{summary.mean_tokens_per_chunk:.2f}")
@@ -1774,8 +1804,6 @@ def print_summary(summary: Summary) -> None:
     print(f"{'TPOT* dropped min/max':<30}"
           f"{summary.tpot_corrected_min_dropped_ms:.2f} / "
           f"{summary.tpot_corrected_max_dropped_ms:.2f}")
-    print(f"{'ITL dropped min/max':<30}"
-          f"{summary.itl_min_dropped_ms:.2f} / {summary.itl_max_dropped_ms:.2f}")
     print(f"{'E2E dropped min/max':<30}"
           f"{summary.e2e_min_dropped_ms:.2f} / {summary.e2e_max_dropped_ms:.2f}")
     print("=" * 60)
